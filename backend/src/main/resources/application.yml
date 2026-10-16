@@ -1,0 +1,65 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: docintel
+
+  datasource:
+    url: jdbc:postgresql://localhost:5432/docintel
+    username: postgres
+    password: ${POSTGRES_PASSWORD:postgrespassword}
+    driver-class-name: org.postgresql.Driver
+
+  sql:
+    init:
+      mode: always
+
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: docintel-group
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+
+  ai:
+    openai:
+      api-key: ${OPENAI_API_KEY:replace_with_your_actual_api_key}
+      base-url: https://api.groq.com/openai
+
+      chat:
+        options:
+          model: llama-3.3-70b-versatile
+
+  servlet:
+    multipart:
+      max-file-size: 10MB
+      max-request-size: 10MB
+
+# File Storage Properties
+app:
+  upload:
+    dir: ./uploads
+  jwt:
+    secret:  ${JWT_SECRET:replace_with_a_secure_random_at_least_32_character_string}
+    expiration-ms: 604800000 # 7 days
+  ai:
+    chunk-size: 2000
+    chunk-overlap: 200
+    max-single-request-tokens: 3000
+    request-delay-ms: 3000
+    max-retry-attempts: 5
+    backoff-multiplier: 2.0
