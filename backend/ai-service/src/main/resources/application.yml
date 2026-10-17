@@ -1,0 +1,58 @@
+server:
+  port: 8083
+
+spring:
+  application:
+    name: ai-service
+
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:5432/${AI_DB_NAME:docintel_ai}
+    username: ${DB_USER:postgres}
+    password: ${POSTGRES_PASSWORD:postgrespassword}
+    driver-class-name: org.postgresql.Driver
+
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      group-id: docintel-ai-group
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+
+  ai:
+    openai:
+      api-key: ${OPENAI_API_KEY:replace_with_your_actual_api_key}
+      base-url: ${SPRING_AI_OPENAI_BASE_URL:https://api.groq.com/openai}
+      chat:
+        options:
+          model: llama-3.3-70b-versatile
+
+# File Storage & Inter-service Properties
+document:
+  service:
+    url: ${DOCUMENT_SERVICE_URL:http://localhost:8082}
+
+app:
+  upload:
+    dir: ${UPLOAD_DIR:./uploads}
+  jwt:
+    secret: ${JWT_SECRET:replace_with_a_secure_random_at_least_32_character_string}
+  ai:
+    chunk-size: 2000
+    chunk-overlap: 200
+    max-single-request-tokens: 3000
+    request-delay-ms: 3000
+    max-retry-attempts: 5
+    backoff-multiplier: 2.0

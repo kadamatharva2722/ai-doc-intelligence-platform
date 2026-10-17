@@ -1,6 +1,6 @@
 # AI-Powered Document Intelligence Platform
 
-A full-stack document processing platform designed to handle large PDFs, Word documents, and text files. Built with Spring Boot 3, Apache Kafka, PostgreSQL, Spring AI, and React, the system processes documents asynchronously, extracts structured metadata, runs MapReduce summarization, flags document risks, and provides interactive Q&A.
+A distributed, microservices-based document processing platform designed to handle large PDFs, Word documents, and text files. Built with Spring Boot 3, Spring Cloud Gateway, Apache Kafka, PostgreSQL, Spring AI, and React, the system processes documents asynchronously, extracts structured metadata, runs MapReduce summarization, flags compliance risks, and provides interactive Q&A.
 
 ---
 
@@ -9,41 +9,82 @@ A full-stack document processing platform designed to handle large PDFs, Word do
 Most AI document tools struggle when dealing with long, multi-page business files:
 1. Shoving 40-page PDFs into a single prompt frequently exceeds token windows or triggers `429 Too Many Requests` rate limits.
 2. Synchronous file uploads freeze the browser and timeout when multiple users submit documents at once.
-3. Raw LLM outputs often hallucinate schemas instead of providing consistent, parseable metadata.
+3. Monolithic designs tightly couple heavy CPU text extraction and LLM rate-limited calls with quick metadata queries and user authentication.
 
-This platform addresses these issues by decoupling file uploads from AI processing using **Kafka**, estimating token volume locally before dispatching requests, and applying a **MapReduce chunking strategy** with exponential backoff retries.
+This platform addresses these challenges with an **event-driven microservices architecture**:
+- **API Gateway** acts as a unified reverse proxy and routing layer for client requests.
+- **Document Service** rapidly ingests files and offloads processing work via **Apache Kafka**.
+- **AI Analysis Service** consumes events, extracts text asynchronously, counts tokens locally (JTokkit CL100K), and runs a **MapReduce chunking strategy** with exponential backoff retries.
+- **Database-per-Service Isolation** ensures each domain maintains its own database schema (`docintel_auth`, `docintel_docs`, `docintel_ai`).
 
 ---
 
-## Architecture & Processing Flow
+## Architecture & System Flow
 
 ```
-[ Browser / React UI ]
-         |
-         |  1. POST /api/documents/upload (Multipart)
-         v
-[ Spring Boot REST API ] ----> [ Local Disk Storage (./uploads) ]
-         |
-         |  2. Publish "document-uploaded" event
-         v
-[ Apache Kafka Topic ]
-         |
-         |  3. Async Consumption
-         v
-[ Kafka Consumer Worker ]
-         |
-         +---> 4. Text Extraction (Apache PDFBox / Apache POI / Tika)
-         |
-         +---> 5. Local Token Counting (JTokkit CL100K)
-         |
-         +---> 6. Chunking & MapReduce LLM Pipeline (Spring AI + Llama 3.3 / Gemini)
-         |          - Per-chunk summarization & metadata extraction
-         |          - Recursive consolidation & risk scoring
-         |
-         +---> 7. Persist Results (PostgreSQL)
-                    - DocumentAnalysis
-                    - Status: PROCESSING -> COMPLETED
+                           [ React UI (Port 80 / 5173) ]
+                                         │
+                         HTTP REST       │ (e.g. /api/auth, /api/documents, /api/analysis)
+                                         ▼
+                     ┌───────────────────────────────────────┐
+                     │    API Gateway (Spring Cloud 8080)    │
+                     └───────┬──────────────┬──────────────┬─┘
+                             │              │              │
+           /api/auth/**      │              │              │ /api/analysis/**
+         ┌───────────────────┘              │              └──────────────────┐
+         ▼                                  ▼                                 ▼
+┌──────────────────┐               ┌──────────────────┐              ┌──────────────────┐
+│   Auth Service   │               │ Document Service │              │    AI Service    │
+│   (Port 8081)    │               │   (Port 8082)    │              │   (Port 8083)    │
+└────────┬─────────┘               └────────┬─────────┘              └────────┬─────────┘
+         │                                  │   ▲                             │   ▲
+         │                                  │   │                             │   │
+         │ PostgreSQL                       │   │ Kafka Topics                │   │
+         │ (docintel_auth)                  │   │                             │   │
+         ▼                                  │   └─────────────────────────┐   │   │
+┌──────────────────┐                        │   "document-status"         │   │   │
+│ docintel_auth DB │                        ▼ (Completed / Failed)        │   │   │
+└──────────────────┘                  ┌───────────────┐                   │   │   │
+                                      │ Kafka Broker  │                   │   │   │
+                                      │ (Topic Queue) │                   │   │   │
+                                      └───────┬───────┘                   │   │   │
+                                              │ "document-processing"     │   │   │
+                                              ▼ (Uploaded event)          │   │   │
+                                      ┌───────────────────────────────────┘   │   │
+                                      │                                       │   │
+                                      │   PostgreSQL (docintel_docs)          │   │ PostgreSQL
+                                      ▼                                       ▼   │ (docintel_ai)
+                             ┌──────────────────┐                    ┌──────────────────┐
+                             │ docintel_docs DB │                    │  docintel_ai DB  │
+                             └──────────────────┘                    └──────────────────┘
+                                      │                                       │
+                                      └──────── Shared Disk Volume ───────────┘
+                                                  ( /app/uploads )
 ```
+
+### Event-Driven Processing Flow
+1. **Upload:** User uploads a file via the React UI to `POST /api/documents/upload`.
+2. **Gateway Route:** API Gateway routes the request to `document-service` (port 8082).
+3. **Storage & Event Publish:** `document-service` persists the file to disk (`/app/uploads`), creates a record in `docintel_docs` with `PENDING` status, and emits a `DocumentUploadedEvent` to the Kafka topic `document-processing`. It immediately returns a `201 Created` tracking response.
+4. **Async AI Processing:** `ai-service` consumes the message from `document-processing`:
+   - Extracts raw text using Apache PDFBox, Apache POI, or Apache Tika.
+   - Calculates tokens locally with JTokkit CL100K tokenizer.
+   - Executes recursive MapReduce chunking with Spring AI and retry backoff.
+   - Saves structured entities, summary, and audit risks into `docintel_ai`.
+5. **Status Update:** `ai-service` publishes a `DocumentStatusUpdatedEvent` to the `document-status` topic.
+6. **Completion:** `document-service` consumes the status event and updates the document status to `COMPLETED` or `FAILED`.
+
+---
+
+## Microservices Breakdown
+
+| Service | Port | Responsibility | Database |
+| :--- | :---: | :--- | :--- |
+| **API Gateway** | `8080` | Reverse proxy, dynamic path routing, global CORS, 50MB request buffering | None |
+| **Auth Service** | `8081` | User registration, authentication, BCrypt hashing, JWT issuance and validation | `docintel_auth` |
+| **Document Service** | `8082` | File upload, storage management, document metadata search, Kafka upload events | `docintel_docs` |
+| **AI Analysis Service** | `8083` | Text extraction, MapReduce summarization, structured JSON parsing, RAG Q&A, diffing | `docintel_ai` |
+| **Common Library** | N/A | Shared DTOs, Kafka event contracts, enums, exception handlers, JWT validator | Shared dependency |
 
 ---
 
@@ -61,11 +102,12 @@ This platform addresses these issues by decoupling file uploads from AI processi
 
 ## Tech Stack
 
-### Backend
+### Microservices Backend
 - **Java 21** & **Spring Boot 3.5.4**
-- **Spring AI (OpenAI / Groq / Gemini compatible)**
+- **Spring Cloud Gateway 4.2.0** (API Gateway)
+- **Spring AI 1.0.0** (OpenAI / Groq / Gemini compatible)
 - **Apache Kafka** (confluentinc cp-kafka 7.5.0)
-- **PostgreSQL 16** (Spring Data JPA / Hibernate)
+- **PostgreSQL 16** with database-per-service isolation
 - **Spring Security** with **JJWT 0.11.5**
 - **Document Parsers:** Apache PDFBox 3.0.4, Apache POI 5.4.1, Apache Tika 3.2.1
 - **Tokenization:** JTokkit (CL100K tokenizer for local, offline token counting)
@@ -83,30 +125,35 @@ This platform addresses these issues by decoupling file uploads from AI processi
 ```
 ai-doc-intelligence-platform/
 ├── backend/
-│   ├── src/
-│   │   ├── main/java/com/enterprise/docintel/
-│   │   │   ├── ai/            # DocumentAiService (MapReduce, RAG, prompt templates)
-│   │   │   ├── config/        # Kafka & Spring AI configuration
-│   │   │   ├── controller/    # Auth, Document, and Analysis REST endpoints
-│   │   │   ├── dto/           # Request/Response data contracts
-│   │   │   ├── entity/        # JPA Entities (User, Document, DocumentAnalysis, etc.)
-│   │   │   ├── repository/    # Spring Data JPA repositories & Specifications
-│   │   │   ├── security/      # JWT filter, auth entrypoint, WebSecurityConfig
-│   │   │   └── service/       # File storage, Kafka producer/consumer, business logic
-│   │   └── main/resources/
-│   │       ├── application.yml
-│   │       └── schema.sql
+│   ├── pom.xml                     # Parent multi-module POM
+│   ├── common-lib/                 # Shared DTOs, Kafka events, enums, JWT validator
+│   │   ├── pom.xml
+│   │   └── src/main/java/com/enterprise/common/
+│   ├── api-gateway/                # Spring Cloud Gateway (Port 8080)
+│   │   ├── Dockerfile
+│   │   ├── pom.xml
+│   │   └── src/main/resources/application.yml
+│   ├── auth-service/               # Authentication & User Management (Port 8081)
+│   │   ├── Dockerfile
+│   │   ├── pom.xml
+│   │   └── src/main/java/com/enterprise/auth/
+│   ├── document-service/           # Uploads & Document Metadata (Port 8082)
+│   │   ├── Dockerfile
+│   │   ├── pom.xml
+│   │   └── src/main/java/com/enterprise/document/
+│   └── ai-service/                 # Text extraction, MapReduce, RAG Q&A (Port 8083)
+│       ├── Dockerfile
+│       ├── pom.xml
+│       └── src/main/java/com/enterprise/ai/
+├── frontend/                       # React 19 + Tailwind CSS Frontend (Port 80 / 5173)
 │   ├── Dockerfile
-│   └── pom.xml
-├── frontend/
-│   ├── src/
-│   │   ├── components/        # Layout, sidebar, top nav
-│   │   ├── pages/             # Dashboard, Upload, Document Drawer, Details, Compare, Auth
-│   │   └── services/          # Axios instance with JWT interceptors
-│   ├── Dockerfile
-│   └── package.json
-├── docker-compose.yml         # Multi-container orchestration (DB, Kafka, Zookeeper, App)
-└── .gitignore
+│   ├── package.json
+│   └── src/
+├── docker/
+│   └── postgres/
+│       └── init-databases.sql      # Auto-creates docintel_auth, docintel_docs, docintel_ai
+├── docker-compose.yml              # Microservices stack orchestration
+└── README.md
 ```
 
 ---
@@ -127,66 +174,92 @@ ai-doc-intelligence-platform/
    cd ai-doc-intelligence-platform
    ```
 
-2. **Create your local `.env` file at the root:**
+2. **Configure your environment variables in `.env` (or pass inline):**
    ```env
    POSTGRES_PASSWORD=postgrespassword
    OPENAI_API_KEY=your_groq_or_openai_or_gemini_api_key_here
    JWT_SECRET=super_secret_jwt_key_that_is_at_least_32_characters_long_12345
+   SPRING_AI_OPENAI_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
    ```
 
-3. **Start the containers:**
+3. **Start all microservices and infrastructure:**
    ```bash
    docker compose up --build
    ```
 
 4. **Access the application:**
-   - Frontend UI: `http://localhost`
-   - Backend API: `http://localhost:8080/api`
-   - PostgreSQL: `localhost:5432` (db: `docintel`, user: `postgres`)
-   - Kafka: `localhost:9092`
+   - **Frontend UI:** `http://localhost`
+   - **API Gateway:** `http://localhost:8080/api`
+   - **Auth Service:** `http://localhost:8081`
+   - **Document Service:** `http://localhost:8082`
+   - **AI Analysis Service:** `http://localhost:8083`
+   - **PostgreSQL:** `localhost:5432` (`docintel_auth`, `docintel_docs`, `docintel_ai`)
+   - **Kafka:** `localhost:9092`
 
 ---
 
-### Option 2: Running Services Manually
+### Option 2: Running Services Manually for Development
 
 #### 1. Start Infrastructure (Postgres & Kafka)
 ```bash
 docker compose up -d postgres zookeeper kafka
 ```
 
-#### 2. Run the Backend
+#### 2. Build the Maven Multi-Module Backend
+From the root directory:
 ```bash
 cd backend
-mvn clean spring-boot:run
+mvn clean install -DskipTests
 ```
-*The backend runs on port 8080.*
 
-#### 3. Run the Frontend
+#### 3. Run Individual Microservices
+You can start each service in separate terminal windows:
+```bash
+# Terminal 1: Auth Service
+cd backend/auth-service
+mvn spring-boot:run
+
+# Terminal 2: Document Service
+cd backend/document-service
+mvn spring-boot:run
+
+# Terminal 3: AI Service
+cd backend/ai-service
+mvn spring-boot:run
+
+# Terminal 4: API Gateway
+cd backend/api-gateway
+mvn spring-boot:run
+```
+
+#### 4. Run Frontend
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
-*The dev server runs on `http://localhost:5173`.*
+*Frontend runs on `http://localhost:5173` and routes API requests to `http://localhost:8080/api` through the API Gateway.*
 
 ---
 
 ## API Overview
 
-| Method | Endpoint | Description | Auth Required |
-| :--- | :--- | :--- | :---: |
-| `POST` | `/api/auth/register` | Register new user account (`EMPLOYEE` / `ADMIN`) | No |
-| `POST` | `/api/auth/login` | Authenticate and obtain JWT bearer token | No |
-| `POST` | `/api/documents/upload` | Upload PDF/DOCX/TXT file for async processing | Yes |
-| `GET` | `/api/documents` | Fetch all documents owned by user (or all if admin) | Yes |
-| `GET` | `/api/documents/{id}` | Get document metadata and processing status | Yes |
-| `GET` | `/api/documents/search` | Filter documents by filename, format, date range | Yes |
-| `GET` | `/api/documents/nl-search` | Natural language semantic search query | Yes |
-| `GET` | `/api/analysis/{id}` | Retrieve AI summary, structured JSON, & issues | Yes |
-| `POST` | `/api/analysis/{id}/chat` | Ask questions against document via RAG context | Yes |
-| `GET` | `/api/analysis/{id}/chat` | Retrieve Q&A history for document | Yes |
-| `POST` | `/api/analysis/compare` | Compare two documents and generate diff report | Yes |
-| `GET` | `/api/analysis/dashboard` | Aggregated metrics (uploads, requests, totals) | Yes |
+All requests are unified through the **API Gateway** (`http://localhost:8080`):
+
+| Method | Endpoint | Routed To | Description | Auth Required |
+| :--- | :--- | :--- | :--- | :---: |
+| `POST` | `/api/auth/register` | `auth-service:8081` | Register new user account (`EMPLOYEE` / `ADMIN`) | No |
+| `POST` | `/api/auth/login` | `auth-service:8081` | Authenticate and obtain JWT bearer token | No |
+| `POST` | `/api/documents/upload` | `document-service:8082` | Upload PDF/DOCX/TXT file for async processing | Yes |
+| `GET` | `/api/documents` | `document-service:8082` | Fetch all documents owned by user (or all if admin) | Yes |
+| `GET` | `/api/documents/{id}` | `document-service:8082` | Get document metadata and processing status | Yes |
+| `GET` | `/api/documents/search` | `document-service:8082` | Filter documents by filename, format, date range | Yes |
+| `GET` | `/api/documents/stats` | `document-service:8082` | Get document count statistics | Yes |
+| `GET` | `/api/analysis/{id}` | `ai-service:8083` | Retrieve AI summary, structured JSON, & audit issues | Yes |
+| `POST` | `/api/analysis/{id}/chat` | `ai-service:8083` | Ask questions against document via RAG context | Yes |
+| `GET` | `/api/analysis/{id}/chat` | `ai-service:8083` | Retrieve Q&A history for document | Yes |
+| `POST` | `/api/analysis/compare` | `ai-service:8083` | Compare two documents and generate diff report | Yes |
+| `GET` | `/api/analysis/dashboard` | `ai-service:8083` | Aggregated dashboard metrics across platform | Yes |
 
 ---
 
@@ -196,8 +269,12 @@ npm run dev
 | :--- | :--- | :--- |
 | `POSTGRES_PASSWORD` | PostgreSQL database password | `postgrespassword` |
 | `OPENAI_API_KEY` | API Key for LLM provider (Groq / Gemini / OpenAI) | None |
+| `SPRING_AI_OPENAI_BASE_URL` | Base URL for OpenAI-compatible endpoint | `https://generativelanguage.googleapis.com/v1beta/openai/` |
 | `JWT_SECRET` | Secret key for signing HS256 JWT tokens (>= 32 chars) | Dev fallback key |
-| `SPRING_KAFKA_BOOTSTRAP_SERVERS` | Kafka broker host & port | `localhost:9092` |
+| `KAFKA_BOOTSTRAP_SERVERS` | Kafka broker host & port | `localhost:9092` (or `kafka:29092` in Docker) |
+| `AUTH_SERVICE_URL` | Gateway target URL for Auth Service | `http://auth-service:8081` |
+| `DOCUMENT_SERVICE_URL` | Gateway target URL for Document Service | `http://document-service:8082` |
+| `AI_SERVICE_URL` | Gateway target URL for AI Service | `http://ai-service:8083` |
 
 ---
 
